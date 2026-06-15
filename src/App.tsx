@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 import {
   AcademicCapIcon,
@@ -30,6 +30,31 @@ type DownloadFile = {
   size: number
   modifiedAt: string
   pattern: string
+  guess?: DownloadGuess
+}
+
+type DownloadGuess = DownloadGuessCandidate & {
+  candidates: DownloadGuessCandidate[]
+}
+
+type DownloadGuessCandidate = {
+  targetId: string
+  team: Team
+  subteam?: string
+  name: string
+  folder: string
+  file: string
+  pattern: string
+  score: number
+  sameRowsPercent: number
+  existingRowsMatchedPercent: number
+  downloadedRows: number
+  existingRows: number
+  matchingRows: number
+  addedRows: number
+  removedRows: number
+  teamIds: string[]
+  teamNames: string[]
 }
 
 type TeamStatus = {
@@ -147,6 +172,9 @@ function App() {
   const [allGenerateRunning, setAllGenerateRunning] = useState(false)
   const [generateRuns, setGenerateRuns] = useState<Record<string, GenerateRun>>({})
   const [folderLabels, setFolderLabels] = useState<Record<string, string>>({})
+  const [autoImportBestGuess, setAutoImportBestGuess] = useState(false)
+  const autoImportEnabled = useRef(false)
+  const autoImportInFlight = useRef(false)
 
   const teams = config?.teams ?? fallbackTeams
   const targetOptions =
@@ -219,18 +247,27 @@ function App() {
     }
   }, [])
 
+  const loadDownloads = useCallback(async (activeSeason: string) => {
+    const response = await api.get<DownloadFile[]>('/downloads', {
+      params: { season: activeSeason },
+    })
+    setDownloads(response.data)
+  }, [])
+
   const loadAll = useCallback(async () => {
     setIsDataLoading(true)
     setStatus('Loading workspace status')
     try {
-      const [configResponse, downloadsResponse] = await Promise.all([
-        api.get<AppConfig>('/config'),
-        api.get<DownloadFile[]>('/downloads'),
-      ])
+      const configResponse = await api.get<AppConfig>('/config')
       const activeSeason = season || configResponse.data.defaultSeason
-      const teamsResponse = await api.get<TeamStatus[]>('/teams', {
-        params: { season: activeSeason },
-      })
+      const [downloadsResponse, teamsResponse] = await Promise.all([
+        api.get<DownloadFile[]>('/downloads', {
+          params: { season: activeSeason },
+        }),
+        api.get<TeamStatus[]>('/teams', {
+          params: { season: activeSeason },
+        }),
+      ])
 
       setConfig(configResponse.data)
       setSeason(activeSeason)
@@ -260,11 +297,32 @@ function App() {
   }, [loadAll])
 
   useEffect(() => {
+    autoImportEnabled.current = autoImportBestGuess
+  }, [autoImportBestGuess])
+
+  useEffect(() => {
     if (config) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       void loadTeamStatuses(season)
+      void loadDownloads(season)
     }
-  }, [config, loadTeamStatuses, season])
+  }, [config, loadDownloads, loadTeamStatuses, season])
+
+  useEffect(() => {
+    setRowTargets((current) => {
+      let changed = false
+      const next = { ...current }
+
+      for (const file of downloads) {
+        if (!next[file.name] && file.guess) {
+          next[file.name] = getGuessTargetId(file)
+          changed = true
+        }
+      }
+
+      return changed ? next : current
+    })
+  }, [downloads])
 
   useEffect(() => {
     if (config) {
@@ -276,10 +334,9 @@ function App() {
   useEffect(() => {
     const source = new EventSource(`${api.defaults.baseURL}/downloads/events`)
 
-    source.onmessage = (event) => {
-      const message = JSON.parse(event.data) as { files: DownloadFile[] }
-      setDownloads(message.files)
+    source.onmessage = () => {
       setStatus('Download folder updated')
+      void loadDownloads(season)
     }
 
     source.onerror = () => {
@@ -287,14 +344,80 @@ function App() {
     }
 
     return () => source.close()
-  }, [])
+  }, [loadDownloads, season])
+
+  function getMoveTargetId(file: DownloadFile) {
+    const rowTargetId = rowTargets[file.name]
+
+    if (file.guess) {
+      return rowTargetId || getGuessTargetId(file)
+    }
+
+    return selectedAll ? rowTargetId : selectedTarget || rowTargetId
+  }
+
+  function getGuessTargetId(file: DownloadFile) {
+    if (!file.guess) {
+      return ''
+    }
+
+    return isStatisticsFile(file.name) ? file.guess.team : file.guess.targetId
+  }
+
+  function shouldShowRowTarget(file: DownloadFile) {
+    if (!selectedTarget || selectedAll) {
+      return true
+    }
+
+    if (!file.guess) {
+      return false
+    }
+
+    return selectedTarget !== getGuessTargetId(file)
+  }
+
+  function isExactDuplicate(file: DownloadFile) {
+    return (
+      file.guess?.sameRowsPercent === 100 &&
+      file.guess.existingRowsMatchedPercent === 100
+    )
+  }
 
   async function moveFile(file: DownloadFile) {
     if (controlsLocked || isGenerating) {
       return
     }
 
-    const targetId = selectedAll ? rowTargets[file.name] : selectedTarget || rowTargets[file.name]
+    if (isExactDuplicate(file)) {
+      setStatus(`${file.name} is already fully imported`)
+      return
+    }
+
+    await moveFileToTarget(file, getMoveTargetId(file))
+  }
+
+  async function clearDownload(file: DownloadFile) {
+    setMovingFile(file.name)
+    setStatus(`Clearing ${file.name}`)
+
+    try {
+      const response = await api.post<{ downloads: DownloadFile[] }>('/downloads/clear', {
+        filename: file.name,
+        season,
+      })
+      setDownloads(response.data.downloads)
+      setStatus(`Cleared ${file.name}`)
+    } catch (error) {
+      const message = axios.isAxiosError(error)
+        ? error.response?.data?.message ?? error.message
+        : 'Clear failed'
+      setStatus(Array.isArray(message) ? message.join(', ') : message)
+    } finally {
+      setMovingFile(null)
+    }
+  }
+
+  async function moveFileToTarget(file: DownloadFile, targetId: string) {
     const target = targetOptions.find((item) => item.id === targetId)
     if (!targetId || targetId === allTargetId || !target) {
       setStatus('Choose a team folder for this file')
@@ -333,6 +456,73 @@ function App() {
       setMovingFile(null)
     }
   }
+
+  useEffect(() => {
+    if (
+      !autoImportBestGuess ||
+      autoImportInFlight.current ||
+      controlsLocked ||
+      isGenerating ||
+      isDataLoading ||
+      movingFile
+    ) {
+      return
+    }
+
+    const eligibleFiles = downloads
+      .filter((download) => {
+        const targetId = getGuessTargetId(download)
+        const target = targetOptions.find((item) => item.id === targetId)
+
+        return (
+          download.guess &&
+          download.guess.existingRowsMatchedPercent === 100 &&
+          targetId &&
+          target &&
+          (!isStatisticsFile(download.name) || target.level === 0)
+        )
+      })
+      .sort(
+        (left, right) =>
+          new Date(left.modifiedAt).getTime() - new Date(right.modifiedAt).getTime(),
+      )
+    const file =
+      eligibleFiles.find((download) => getGuessTargetId(download) === selectedTarget) ??
+      eligibleFiles[0]
+
+    if (!file) {
+      return
+    }
+
+    const targetId = getGuessTargetId(file)
+    if (isExactDuplicate(file)) {
+      return
+    }
+
+    if (selectedTarget !== targetId) {
+      setStatus(`Selecting ${targetId} for ${file.name}`)
+      setSelectedTarget(targetId)
+      return
+    }
+
+    if (!autoImportEnabled.current) {
+      return
+    }
+
+    autoImportInFlight.current = true
+    void moveFileToTarget(file, targetId).finally(() => {
+      autoImportInFlight.current = false
+    })
+  }, [
+    autoImportBestGuess,
+    controlsLocked,
+    downloads,
+    isDataLoading,
+    isGenerating,
+    movingFile,
+    selectedTarget,
+    targetOptions,
+  ])
 
   async function generate(targetId = selectedGenerateTargetId) {
     if (isGenerating || controlsLocked) {
@@ -1010,7 +1200,21 @@ function App() {
 
           <aside className="rounded border border-slate-300 bg-white">
             <div className="border-b border-slate-200 px-4 py-3">
-              <h2 className="text-sm font-semibold uppercase text-slate-500">Download Folder</h2>
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold uppercase text-slate-500">Download Folder</h2>
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={autoImportBestGuess}
+                    onChange={(event) => {
+                      autoImportEnabled.current = event.target.checked
+                      setAutoImportBestGuess(event.target.checked)
+                    }}
+                    className="h-4 w-4 rounded border-slate-300 text-red-700"
+                  />
+                  automatic import best guess
+                </label>
+              </div>
               <p className="mt-1 text-xs text-slate-500">
                 {config?.downloadPatterns.join(' | ') ?? 'Waiting for patterns'}
               </p>
@@ -1023,50 +1227,88 @@ function App() {
                   {downloads.map((file) => (
                     <div key={file.name} className="p-4">
                       <div className="flex items-start gap-3">
-                        <DocumentArrowDownIcon className="mt-0.5 h-5 w-5 flex-none text-slate-500" />
+                        <DocumentArrowDownIcon
+                          className={`mt-0.5 h-5 w-5 flex-none ${
+                            isExactDuplicate(file) ? 'text-slate-300' : 'text-slate-500'
+                          }`}
+                        />
                         <div className="min-w-0 flex-1">
-                          <p className="break-words text-sm font-semibold">{file.name}</p>
+                          <p
+                            className={`break-words text-sm font-semibold ${
+                              isExactDuplicate(file)
+                                ? 'text-slate-500 line-through'
+                                : 'text-slate-950'
+                            }`}
+                          >
+                            {file.name}
+                          </p>
                           <p className="mt-1 text-xs text-slate-500">
                             {formatBytes(file.size)} · {new Date(file.modifiedAt).toLocaleString()}
                           </p>
+                          {file.guess && (
+                            <p className="mt-2 rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-900">
+                              Guess {file.guess.name}: {file.guess.sameRowsPercent}% same rows (
+                              {file.guess.matchingRows}/{file.guess.downloadedRows}), existing{' '}
+                              {file.guess.existingRowsMatchedPercent}% matched
+                            </p>
+                          )}
                         </div>
                       </div>
-                      <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
-                        {(!selectedTarget || selectedAll) && (
-                          <select
-                            value={rowTargets[file.name] ?? ''}
-                            disabled={controlsLocked}
-                            onChange={(event) =>
-                              setRowTargets((current) => ({
-                                ...current,
-                                [file.name]: event.target.value,
-                              }))
-                            }
-                            className="h-9 rounded border border-slate-300 bg-white px-2 text-sm disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
+                      {isExactDuplicate(file) ? (
+                        <div className="mt-3 flex justify-end">
+                          <button
+                            type="button"
+                            disabled={controlsLocked || isGenerating || movingFile === file.name}
+                            onClick={() => void clearDownload(file)}
+                            className="inline-flex h-9 items-center rounded border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-wait disabled:bg-slate-100 disabled:text-slate-400"
                           >
-                            <option value="">Choose folder</option>
-                            {targetOptions
-                              .filter((target) => !isStatisticsFile(file.name) || target.level === 0)
-                              .map((target) => (
-                                <option key={target.id} value={target.id}>
-                                  {target.level > 0 ? `  ${target.name}` : target.name}
-                                </option>
-                              ))}
-                          </select>
-                        )}
-                        <button
-                          type="button"
-                          disabled={controlsLocked || isGenerating || movingFile === file.name}
-                          onClick={() => void moveFile(file)}
-                          className="col-start-2 inline-flex h-9 items-center rounded bg-slate-900 px-3 text-sm font-medium text-white hover:bg-slate-700 disabled:cursor-wait disabled:bg-slate-400"
-                        >
-                          {movingFile === file.name
-                            ? 'Importing'
-                            : `Import${
-                                selectedTarget && !selectedAll ? ` to ${selectedTarget}` : ''
-                              }`}
-                        </button>
-                      </div>
+                            {movingFile === file.name ? 'Clearing' : 'Clear'}
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="mt-3 grid grid-cols-[1fr_auto_auto] gap-2">
+                          {shouldShowRowTarget(file) && (
+                            <select
+                              value={rowTargets[file.name] ?? ''}
+                              disabled={controlsLocked}
+                              onChange={(event) =>
+                                setRowTargets((current) => ({
+                                  ...current,
+                                  [file.name]: event.target.value,
+                                }))
+                              }
+                              className="h-9 rounded border border-slate-300 bg-white px-2 text-sm disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
+                            >
+                              <option value="">Choose folder</option>
+                              {targetOptions
+                                .filter((target) => !isStatisticsFile(file.name) || target.level === 0)
+                                .map((target) => (
+                                  <option key={target.id} value={target.id}>
+                                    {target.level > 0 ? `  ${target.name}` : target.name}
+                                  </option>
+                                ))}
+                            </select>
+                          )}
+                          <button
+                            type="button"
+                            disabled={controlsLocked || isGenerating || movingFile === file.name}
+                            onClick={() => void moveFile(file)}
+                            className="col-start-2 inline-flex h-9 items-center rounded bg-slate-900 px-3 text-sm font-medium text-white hover:bg-slate-700 disabled:cursor-wait disabled:bg-slate-400"
+                          >
+                            {movingFile === file.name
+                              ? 'Importing'
+                              : `Import${getMoveTargetId(file) ? ` to ${getMoveTargetId(file)}` : ''}`}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={controlsLocked || isGenerating || movingFile === file.name}
+                            onClick={() => void clearDownload(file)}
+                            className="col-start-3 inline-flex h-9 items-center rounded border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-wait disabled:bg-slate-100 disabled:text-slate-400"
+                          >
+                            {movingFile === file.name ? 'Clearing' : 'Clear'}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

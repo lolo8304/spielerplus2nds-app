@@ -5,7 +5,7 @@ React/TypeScript frontend for moving SpielerPlus exports into the NDS data folde
 ## Requirements
 
 - Node.js and npm
-- Running API server from `spielerplus2nds-api` on `http://localhost:3001`
+- Running API server from `spielerplus2nds-api` on `http://localhost:3002`
 - Browser access to the local Vite app on `http://localhost:5173`
 - Data folder available at `/Users/Lolo/git/spielerplus2nds/data`
 - Download folder available at `/Users/Lolo/Downloads`
@@ -213,13 +213,13 @@ The frontend reads configuration from the API `GET /config` endpoint.
 By default the API URL is:
 
 ```text
-http://localhost:3001
+http://localhost:3002
 ```
 
 To override it, set:
 
 ```sh
-VITE_API_URL=http://localhost:3001
+VITE_API_URL=http://localhost:3002
 ```
 
 ## Notes

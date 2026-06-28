@@ -150,7 +150,7 @@ type DirectoryPickerWindow = Window & {
 }
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL ?? 'http://localhost:3001',
+  baseURL: import.meta.env.VITE_API_URL ?? 'http://localhost:3002',
 })
 
 const fallbackTeams: Team[] = ['B', 'C', 'Da', 'Db', 'Dc', 'Dd', 'E', 'F', 'G']

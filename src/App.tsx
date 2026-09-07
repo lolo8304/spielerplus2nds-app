@@ -3,7 +3,9 @@ import axios from 'axios'
 import {
   AcademicCapIcon,
   ArrowPathIcon,
+  ArrowTopRightOnSquareIcon,
   CheckCircleIcon,
+  ClipboardDocumentIcon,
   DocumentArrowDownIcon,
   ExclamationTriangleIcon,
   FolderIcon,
@@ -150,19 +152,19 @@ type DirectoryPickerWindow = Window & {
 }
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL ?? 'http://localhost:3002',
+  baseURL: import.meta.env.VITE_API_URL ?? 'http://localhost:3000',
 })
 
-const fallbackTeams: Team[] = ['B', 'C', 'Da', 'Db', 'Dc', 'Dd', 'E', 'F', 'G']
 const logoUrl = 'https://www.fcrww.ch/wp-content/uploads/2025/03/fcrww-lolo-400x400-1.jpg'
 const allTargetId = '__all'
+const chooseSeasonFolderValue = '__choose-season-folder'
 
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [downloads, setDownloads] = useState<DownloadFile[]>([])
   const [teamStatuses, setTeamStatuses] = useState<TeamStatus[]>([])
   const [wildcards, setWildcards] = useState<WildcardEntry[]>([])
-  const [season, setSeason] = useState('2026-1')
+  const [season, setSeason] = useState('2026-2')
   const [selectedTarget, setSelectedTarget] = useState('')
   const [rowTargets, setRowTargets] = useState<Record<string, string>>({})
   const [status, setStatus] = useState('Loading workspace status')
@@ -175,12 +177,21 @@ function App() {
   const [autoImportBestGuess, setAutoImportBestGuess] = useState(false)
   const autoImportEnabled = useRef(false)
   const autoImportInFlight = useRef(false)
+  const [copiedTexts, setCopiedTexts] = useState<Record<string, boolean>>({})
+  const copiedTextTimers = useRef(new Map<string, number>())
 
-  const teams = config?.teams ?? fallbackTeams
-  const targetOptions =
-    teamStatuses.length > 0
-      ? teamStatuses
-      : teams.map((team) => createFallbackStatus(team, season, config?.dataFolder))
+  useEffect(() => {
+    const timers = copiedTextTimers.current
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer))
+      timers.clear()
+    }
+  }, [])
+
+  const seasonOptions = season
+    ? Array.from(new Set([...(config?.seasons ?? ['2026-2']), season]))
+    : config?.seasons ?? ['2026-2']
+  const targetOptions = teamStatuses.filter((team) => team.exists)
   const selectedStatus = targetOptions.find((item) => item.id === selectedTarget)
   const selectedAll = selectedTarget === allTargetId
   const selectedTeamFolder =
@@ -233,6 +244,15 @@ function App() {
     },
   ]
 
+  const applyTeamStatuses = useCallback((statuses: TeamStatus[]) => {
+    setTeamStatuses(statuses)
+    setSelectedTarget((current) =>
+      current === allTargetId || statuses.some((team) => team.id === current && team.exists)
+        ? current
+        : '',
+    )
+  }, [])
+
   const loadTeamStatuses = useCallback(async (activeSeason: string) => {
     setIsDataLoading(true)
     setStatus(`Loading ${activeSeason}`)
@@ -240,12 +260,12 @@ function App() {
       const response = await api.get<TeamStatus[]>('/teams', {
         params: { season: activeSeason },
       })
-      setTeamStatuses(response.data)
+      applyTeamStatuses(response.data)
       setStatus('Ready')
     } finally {
       setIsDataLoading(false)
     }
-  }, [])
+  }, [applyTeamStatuses])
 
   const loadDownloads = useCallback(async (activeSeason: string) => {
     const response = await api.get<DownloadFile[]>('/downloads', {
@@ -272,12 +292,12 @@ function App() {
       setConfig(configResponse.data)
       setSeason(activeSeason)
       setDownloads(downloadsResponse.data)
-      setTeamStatuses(teamsResponse.data)
+      applyTeamStatuses(teamsResponse.data)
       setStatus('Ready')
     } finally {
       setIsDataLoading(false)
     }
-  }, [season])
+  }, [season, applyTeamStatuses])
 
   const loadWildcards = useCallback(async (activeSeason: string, targetId: string) => {
     if (!targetId || targetId === allTargetId) {
@@ -309,22 +329,6 @@ function App() {
   }, [config, loadDownloads, loadTeamStatuses, season])
 
   useEffect(() => {
-    setRowTargets((current) => {
-      let changed = false
-      const next = { ...current }
-
-      for (const file of downloads) {
-        if (!next[file.name] && file.guess) {
-          next[file.name] = getGuessTargetId(file)
-          changed = true
-        }
-      }
-
-      return changed ? next : current
-    })
-  }, [downloads])
-
-  useEffect(() => {
     if (config) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       void loadWildcards(season, selectedTarget)
@@ -347,13 +351,26 @@ function App() {
   }, [loadDownloads, season])
 
   function getMoveTargetId(file: DownloadFile) {
+    // Store only manual choices; otherwise preselect the latest API guess.
     const rowTargetId = rowTargets[file.name]
 
-    if (file.guess) {
-      return rowTargetId || getGuessTargetId(file)
+    if (rowTargetId !== undefined) {
+      return rowTargetId
     }
 
-    return selectedAll ? rowTargetId : selectedTarget || rowTargetId
+    if (isActivityFile(file.name)) {
+      return ''
+    }
+
+    if (file.guess) {
+      return getGuessTargetId(file)
+    }
+
+    if (selectedAll) {
+      return ''
+    }
+
+    return isStatisticsFile(file.name) ? selectedStatus?.team ?? '' : selectedTarget
   }
 
   function getGuessTargetId(file: DownloadFile) {
@@ -365,6 +382,10 @@ function App() {
   }
 
   function shouldShowRowTarget(file: DownloadFile) {
+    if (isStatisticsFile(file.name) || isActivityFile(file.name)) {
+      return true
+    }
+
     if (!selectedTarget || selectedAll) {
       return true
     }
@@ -378,6 +399,7 @@ function App() {
 
   function isExactDuplicate(file: DownloadFile) {
     return (
+      !isActivityFile(file.name) &&
       file.guess?.sameRowsPercent === 100 &&
       file.guess.existingRowsMatchedPercent === 100
     )
@@ -475,6 +497,7 @@ function App() {
         const target = targetOptions.find((item) => item.id === targetId)
 
         return (
+          !isActivityFile(download.name) &&
           download.guess &&
           download.guess.existingRowsMatchedPercent === 100 &&
           targetId &&
@@ -613,6 +636,31 @@ function App() {
     })
   }
 
+  function copyKey(...parts: string[]) {
+    return JSON.stringify([selectedGenerateKey, ...parts])
+  }
+
+  async function copyText(value: string, label: 'date' | 'first name' | 'last name', key: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      setStatus(`Copied ${label} ${value}`)
+      window.clearTimeout(copiedTextTimers.current.get(key))
+      setCopiedTexts((current) => ({ ...current, [key]: true }))
+      copiedTextTimers.current.set(key, window.setTimeout(() => {
+        setCopiedTexts((current) => {
+          const next = { ...current }
+          delete next[key]
+          return next
+        })
+        copiedTextTimers.current.delete(key)
+      }, 20_000))
+      return true
+    } catch {
+      setStatus(`Could not copy ${label} ${value}. Select the ${label} and copy it manually.`)
+      return false
+    }
+  }
+
   function dismissMissingEvent(sourceTeam: string, type: string, date: string) {
     if (!selectedGenerateKey) {
       return
@@ -691,13 +739,62 @@ function App() {
     setStatus(`Selected ${handle.name}`)
   }
 
+  async function pickSeasonFolder() {
+    if (controlsLocked) {
+      return
+    }
+
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker
+
+    if (!picker) {
+      setStatus('Native folder picker is not supported in this browser')
+      return
+    }
+
+    const handle = await picker()
+    setSeason(handle.name)
+    setSelectedTarget('')
+    setStatus(`Selected season folder ${handle.name}`)
+  }
+
+  function handleSeasonChange(value: string) {
+    if (value === chooseSeasonFolderValue) {
+      void pickSeasonFolder()
+      return
+    }
+
+    setSeason(value)
+  }
+
   return (
     <div className="min-h-screen bg-slate-100 text-slate-950">
       <header className="border-b border-slate-300 bg-white">
         <div className="flex min-w-[1180px] items-center gap-5 px-6 py-4">
           <img src={logoUrl} alt="FCRWW" className="h-14 w-14 rounded object-cover" />
           <div className="min-w-0 flex-1">
-            <h1 className="text-2xl font-semibold tracking-normal">{config?.title ?? 'FCRWW - SpielerPlus to NDS.'}</h1>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <h1 className="text-2xl font-semibold tracking-normal">{config?.title ?? 'FCRWW - SpielerPlus to NDS.'}</h1>
+              <div className="flex items-center gap-2">
+                <a
+                  href="https://nds.baspo.admin.ch/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-8 items-center gap-1.5 rounded border border-slate-300 bg-white px-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  NDS
+                  <ArrowTopRightOnSquareIcon className="h-4 w-4" />
+                </a>
+                <a
+                  href="https://www.spielerplus.de/site/select-team"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-8 items-center gap-1.5 rounded border border-slate-300 bg-white px-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  SpielerPlus
+                  <ArrowTopRightOnSquareIcon className="h-4 w-4" />
+                </a>
+              </div>
+            </div>
             <p className="mt-1 text-sm text-slate-600">{status}</p>
           </div>
           <button
@@ -718,16 +815,17 @@ function App() {
       <main className="min-w-[1180px] px-6 py-5">
         <section className="grid grid-cols-[180px_minmax(280px,1fr)_minmax(300px,1fr)_minmax(300px,1fr)] gap-3 rounded border border-slate-300 bg-white p-4">
           <label className="block">
-            <span className="text-xs font-semibold uppercase text-slate-500">Season</span>
+            <span className="text-xs font-semibold uppercase text-slate-500">Season folder</span>
             <select
               value={season}
-              onChange={(event) => setSeason(event.target.value)}
+              onChange={(event) => handleSeasonChange(event.target.value)}
               disabled={controlsLocked}
               className="mt-1 h-10 w-full rounded border border-slate-300 bg-white px-3 text-sm disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
             >
-              {(config?.seasons ?? ['2026-1']).map((item) => (
+              {seasonOptions.map((item) => (
                 <option key={item}>{item}</option>
               ))}
+              <option value={chooseSeasonFolderValue}>Choose folder...</option>
             </select>
           </label>
 
@@ -940,35 +1038,57 @@ function App() {
                           <span>Person</span>
                           <span>Date of birth</span>
                         </div>
-                        {generateResult.persons.missing.map((person) => (
-                          <div
-                            key={`${person.sourceTeam}-${person.name}-${person.dateOfBirth}`}
-                            className="grid grid-cols-[70px_minmax(160px,1fr)_130px] items-center px-3 py-2"
-                          >
-                            <span className="font-medium text-slate-900">
-                              {person.sourceTeam || '-'}
-                            </span>
-                            <span className="flex items-center gap-2 font-medium text-slate-900">
-                              <button
-                                type="button"
-                                title="Remove from list"
-                                aria-label={`Remove ${person.name}`}
-                                onClick={() =>
-                                  dismissMissingPerson(
-                                    person.sourceTeam,
-                                    person.name,
-                                    person.dateOfBirth,
+                        {generateResult.persons.missing.map((person) => {
+                          const [firstName = '', ...lastNameParts] = person.name.trim().split(/\s+/)
+                          const lastName = lastNameParts.join(' ')
+                          const firstNameKey = copyKey('first', person.sourceTeam, person.name, person.dateOfBirth)
+                          const lastNameKey = copyKey('last', person.sourceTeam, person.name, person.dateOfBirth)
+
+                          return (
+                            <div
+                              key={`${person.sourceTeam}-${person.name}-${person.dateOfBirth}`}
+                              className="grid grid-cols-[70px_minmax(160px,1fr)_130px] items-center px-3 py-2"
+                            >
+                              <span className="font-medium text-slate-900">
+                                {person.sourceTeam || '-'}
+                              </span>
+                              <span className="flex items-center gap-2 font-medium text-slate-900">
+                                <button
+                                  type="button"
+                                  title="Remove from list"
+                                  aria-label={`Remove ${person.name}`}
+                                  onClick={() =>
+                                    dismissMissingPerson(
+                                      person.sourceTeam,
+                                      person.name,
+                                      person.dateOfBirth,
                                   )
                                 }
                                 className="inline-flex h-7 w-7 flex-none items-center justify-center rounded border border-slate-300 text-slate-600 hover:bg-slate-50"
                               >
                                 <XMarkIcon className="h-4 w-4" />
                               </button>
-                              {person.name}
+                              <span>
+                                <span className={copiedTexts[firstNameKey] ? 'font-bold' : undefined}>{firstName}</span>
+                                {lastName && <> <span className={copiedTexts[lastNameKey] ? 'font-bold' : undefined}>{lastName}</span></>}
+                              </span>
+                              <CopyButton
+                                label={`Copy first name ${firstName}`}
+                                text="First"
+                                disabled={!firstName}
+                                onCopy={() => copyText(firstName, 'first name', firstNameKey)}
+                              />
+                              <CopyButton
+                                label={lastName ? `Copy last name ${lastName}` : 'No last name available'}
+                                text="Last"
+                                disabled={!lastName}
+                                onCopy={() => copyText(lastName, 'last name', lastNameKey)}
+                              />
                             </span>
                             <span>{person.dateOfBirth}</span>
                           </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     </div>
                   )}
@@ -979,7 +1099,7 @@ function App() {
                         Missing or wrong events: register the activity data in NDS
                       </h3>
                       <div className="mt-2 divide-y divide-slate-200 rounded border border-slate-200 text-sm">
-                        <div className="grid grid-cols-[70px_minmax(120px,1fr)_130px] bg-slate-50 px-3 py-2 text-xs font-semibold uppercase text-slate-500">
+                        <div className="grid grid-cols-[70px_minmax(120px,1fr)_150px] bg-slate-50 px-3 py-2 text-xs font-semibold uppercase text-slate-500">
                           <span>Team</span>
                           <span>Activity</span>
                           <span>Date</span>
@@ -987,7 +1107,7 @@ function App() {
                         {generateResult.events.missing.map((event) => (
                           <div
                             key={`${event.sourceTeam}-${event.type}-${event.date}`}
-                            className="grid grid-cols-[70px_minmax(120px,1fr)_130px] px-3 py-2"
+                            className="grid grid-cols-[70px_minmax(120px,1fr)_150px] px-3 py-2"
                           >
                             <span className="font-medium text-slate-900">
                               {event.sourceTeam || '-'}
@@ -1006,7 +1126,15 @@ function App() {
                               </button>
                               {event.type}
                             </span>
-                            <span>{event.date}</span>
+                            <span className="flex items-center gap-2 whitespace-nowrap">
+                              <span className={copiedTexts[copyKey('date', event.sourceTeam, event.type, event.date)] ? 'font-bold' : undefined}>
+                                {event.date}
+                              </span>
+                              <CopyButton
+                                label={`Copy date ${event.date} for ${event.sourceTeam} ${event.type}`}
+                                onCopy={() => copyText(event.date, 'date', copyKey('date', event.sourceTeam, event.type, event.date))}
+                              />
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -1252,6 +1380,11 @@ function App() {
                               {file.guess.existingRowsMatchedPercent}% matched
                             </p>
                           )}
+                          {isActivityFile(file.name) && (
+                            <p className="mt-2 text-xs text-slate-600">
+                              Choose the team manually: activity dates can match across teams.
+                            </p>
+                          )}
                         </div>
                       </div>
                       {isExactDuplicate(file) ? (
@@ -1269,7 +1402,8 @@ function App() {
                         <div className="mt-3 grid grid-cols-[1fr_auto_auto] gap-2">
                           {shouldShowRowTarget(file) && (
                             <select
-                              value={rowTargets[file.name] ?? ''}
+                              value={getMoveTargetId(file)}
+                              aria-label={`Import folder for ${file.name}`}
                               disabled={controlsLocked}
                               onChange={(event) =>
                                 setRowTargets((current) => ({
@@ -1289,7 +1423,7 @@ function App() {
                                 ))}
                             </select>
                           )}
-                          <button
+                          {(!isActivityFile(file.name) || getMoveTargetId(file)) && <button
                             type="button"
                             disabled={controlsLocked || isGenerating || movingFile === file.name}
                             onClick={() => void moveFile(file)}
@@ -1298,7 +1432,7 @@ function App() {
                             {movingFile === file.name
                               ? 'Importing'
                               : `Import${getMoveTargetId(file) ? ` to ${getMoveTargetId(file)}` : ''}`}
-                          </button>
+                          </button>}
                           <button
                             type="button"
                             disabled={controlsLocked || isGenerating || movingFile === file.name}
@@ -1318,6 +1452,52 @@ function App() {
         </section>
       </main>
     </div>
+  )
+}
+
+function CopyButton({
+  label,
+  text,
+  disabled = false,
+  onCopy,
+}: {
+  label: string
+  text?: string
+  disabled?: boolean
+  onCopy: () => Promise<boolean>
+}) {
+  const [copyCount, setCopyCount] = useState(0)
+  const copied = copyCount > 0
+
+  useEffect(() => {
+    if (!copyCount) return
+    const timeout = window.setTimeout(() => setCopyCount(0), 1500)
+    return () => window.clearTimeout(timeout)
+  }, [copyCount])
+
+  async function handleCopy() {
+    if (await onCopy()) {
+      setCopyCount((count) => count + 1)
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      title={copied ? 'Copied' : label}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => void handleCopy()}
+      className="inline-grid h-7 flex-none items-center justify-items-center rounded border border-slate-300 px-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <span className={`col-start-1 row-start-1 inline-flex items-center gap-1 ${copied ? 'invisible' : ''}`} aria-hidden="true">
+        <ClipboardDocumentIcon className="h-4 w-4" />
+        {text}
+      </span>
+      <span className={`col-start-1 row-start-1 text-emerald-700 ${copied ? '' : 'invisible'}`} aria-live="polite">
+        Copied
+      </span>
+    </button>
   )
 }
 
@@ -1443,26 +1623,6 @@ function formatBytes(value: number) {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function createFallbackStatus(team: Team, season: string, dataFolder = '/Users/Lolo/git/spielerplus2nds/data'): TeamStatus {
-  return {
-    id: team,
-    team,
-    name: team,
-    folder: `${dataFolder}/${season}/${team}`,
-    exists: false,
-    level: 0,
-    counts: {
-      players: 0,
-      trainers: 0,
-      assistants: 0,
-      trainings: 0,
-      tournaments: 0,
-      summary: 0,
-      files: 0,
-    },
-  }
-}
-
 function sumTeamCounts(targets: TeamStatus[]) {
   return targets.reduce(
     (total, target) => ({
@@ -1484,6 +1644,10 @@ function sumTeamCounts(targets: TeamStatus[]) {
       files: 0,
     },
   )
+}
+
+function isActivityFile(filename: string) {
+  return /_(?:aktivitäten|aktivitaeten)_.*\.xlsx$/i.test(filename.normalize('NFC'))
 }
 
 function isStatisticsFile(filename: string) {
